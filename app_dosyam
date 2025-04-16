@@ -1,0 +1,375 @@
+from flask import Flask, request, jsonify
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+import mysql.connector
+from flask_cors import CORS
+import bcrypt
+from datetime import da
+
+app = Flask(__name__)
+CORS(app)
+
+# JWT Ayarları
+app.config['JWT_SECRET_KEY'] = 'your-jwt-secret-key'
+jwt = JWTManager(app)
+
+# Veritabanı bağlantısı
+def get_db_connection():
+    return mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="recep35",
+        database="film_review"
+    )
+
+# Kullanıcı Kayıt
+@app.route('/api/users/register', methods=['POST'])
+def register():
+    data = request.json
+    name = data.get('name')
+    email = data.get('email')
+    password = data.get('password')
+
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    cursor.execute("INSERT INTO users (name, email, password, role) VALUES (%s, %s, %s, %s)",
+                   (name, email, hashed_password.decode('utf-8'), 'user'))
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+    return jsonify({'message': 'User registered successfully'}), 201
+
+# Kullanıcı Giriş
+@app.route('/api/users/login', methods=['POST'])
+def login():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+    cursor.close()
+    connection.close()
+
+    if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+        return jsonify({'message': 'Invalid email or password'}), 401
+
+    access_token = create_access_token(identity=str(user['id']))
+    return jsonify({'access_token': access_token, 'name': user['name']}), 200
+
+# Profil Güncelleme
+@app.route('/api/users/profile', methods=['PUT'])
+@jwt_required()
+def update_profile():
+    user_id = get_jwt_identity()
+    data = request.json
+    name = data.get('name')
+    email = data.get('email')
+
+    if not name or not email:
+        return jsonify({'message': 'Name and Email are required'}), 400
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        cursor.execute("UPDATE users SET name = %s, email = %s WHERE id = %s", (name, email, user_id))
+        connection.commit()
+    finally:
+        cursor.close()
+        connection.close()
+
+    return jsonify({'message': 'Profile updated successfully'}), 200
+
+# Parola Değiştirme
+@app.route('/api/users/password', methods=['PUT'])
+@jwt_required()
+def change_password():
+    user_id = get_jwt_identity()
+    data = request.json
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+
+    if not old_password or not new_password:
+        return jsonify({'message': 'Old and New passwords are required'}), 400
+
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+
+    if not bcrypt.checkpw(old_password.encode('utf-8'), user['password'].encode('utf-8')):
+        return jsonify({'message': 'Old password is incorrect'}), 400
+
+    hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
+
+    cursor.execute("UPDATE users SET password = %s WHERE id = %s", (hashed_password.decode('utf-8'), user_id))
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+    return jsonify({'message': 'Password updated successfully'}), 200
+
+#kullanıcı bilgileri alınır;
+@app.route('/api/users/me', methods=['GET'])
+@jwt_required()
+def get_user_info():
+    user_id = get_jwt_identity()
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    try:
+        cursor.execute("SELECT id, name, email FROM users WHERE id = %s", (user_id,))
+        user = cursor.fetchone()
+
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+
+        return jsonify(user), 200
+    except Exception as e:
+        return jsonify({'message': f'Error: {str(e)}'}), 500
+    finally:
+        cursor.close()
+        connection.close()
+
+# Filmleri Listele
+@app.route('/api/movies', methods=['GET'])
+def get_movies():
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM movies")
+    movies = cursor.fetchall()
+
+    cursor.close()
+    connection.close()
+
+    return jsonify(movies), 200
+
+# Film Detayı ve İncelemeleri
+@app.route('/api/movies/<int:movie_id>', methods=['GET'])
+def get_movie_details(movie_id):
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM movies WHERE id = %s", (movie_id,))
+    movie = cursor.fetchone()
+
+    if not movie:
+        return jsonify({'message': 'Movie not found'}), 404
+
+    cursor.execute("SELECT r.id, r.review_text, r.rating, r.review_date, u.name AS reviewer_name FROM reviews r JOIN users u ON r.user_id = u.id WHERE r.movie_id = %s", (movie_id,))
+    reviews = cursor.fetchall()
+
+    cursor.close()
+    connection.close()
+
+    return jsonify({'movie': movie, 'reviews': reviews}), 200
+
+#film adını arama
+@app.route('/api/movies/search', methods=['GET'])
+def search_movies():
+    query = request.args.get('q', '').lower()
+
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    # Film adını arayın
+    cursor.execute("SELECT id, title FROM movies WHERE LOWER(title) LIKE %s", (f"%{query}%",))
+    movies = cursor.fetchall()
+
+    cursor.close()
+    connection.close()
+
+    return jsonify(movies), 200
+
+@app.route('/api/reviews', methods=['POST'])
+@jwt_required()
+def add_review():
+    user_id = get_jwt_identity()
+    data = request.json
+    movie_id = data.get('movie_id')
+    review_text = data.get('review_text')
+    rating = data.get('rating')
+
+    if not movie_id or not review_text or not rating:
+        return jsonify({'message': 'Movie ID, review text, and rating are required'}), 400
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        cursor.execute(
+            "INSERT INTO reviews (user_id, movie_id, review_text, rating, review_date) VALUES (%s, %s, %s, %s, %s)",
+            (user_id, movie_id, review_text, rating, datetime.utcnow())
+        )
+        connection.commit()
+        return jsonify({'message': 'Review added successfully'}), 201
+    except mysql.connector.Error as err:
+        return jsonify({'message': f'Error: {err}'}), 500
+    finally:
+        cursor.close()
+        connection.close()
+
+# İnceleme Güncelleme
+@app.route('/api/reviews/<int:review_id>', methods=['PUT'])
+@jwt_required()
+def update_review(review_id):
+    user_id = get_jwt_identity()
+    data = request.json
+    review_text = data.get('review_text')
+    rating = data.get('rating')
+
+    if not review_text or not rating:
+        return jsonify({'message': 'Review text and rating are required'}), 400
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("UPDATE reviews SET review_text = %s, rating = %s WHERE id = %s AND user_id = %s",
+                   (review_text, rating, review_id, user_id))
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+    return jsonify({'message': 'Review updated successfully'}), 200
+
+#tüm incelemeleri listeleme
+@app.route('/api/reviews', methods=['GET'])
+def get_reviews():
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    try:
+        cursor.execute("""
+            SELECT r.id, r.review_text, r.rating, r.review_date, u.name AS user_name, m.title AS movie_title
+            FROM reviews r
+            JOIN users u ON r.user_id = u.id
+            JOIN movies m ON r.movie_id = m.id
+        """)
+        reviews = cursor.fetchall()
+        return jsonify(reviews), 200
+    except mysql.connector.Error as err:
+        return jsonify({'message': f'Error: {err}'}), 500
+    finally:
+        cursor.close()
+        connection.close()
+
+#favorilere ekleme
+@app.route('/api/favorites', methods=['POST'])
+@jwt_required()
+def add_favorite():
+    user_id = get_jwt_identity()
+    data = request.json
+    movie_id = data.get('movie_id')
+
+    if not movie_id:
+        return jsonify({'message': 'Movie ID is required'}), 400
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        # Favori zaten mevcut mu kontrol et
+        cursor.execute(
+            "SELECT * FROM favorites WHERE user_id = %s AND movie_id = %s",
+            (user_id, movie_id)
+        )
+        favorite = cursor.fetchone()
+
+        if favorite:
+            return jsonify({'message': 'This movie is already in your favorites'}), 400
+
+        # Favoriye ekleme işlemi
+        cursor.execute(
+            "INSERT INTO favorites (user_id, movie_id) VALUES (%s, %s)",
+            (user_id, movie_id)
+        )
+        connection.commit()
+        return jsonify({'message': 'Movie added to favorites successfully'}), 201
+
+    except Exception as e:
+        return jsonify({'message': f'Error: {str(e)}'}), 500
+
+    finally:
+        cursor.close()
+        connection.close()
+
+#favorileri listeleme
+@app.route('/api/favorites', methods=['GET'])
+@jwt_required()
+def get_favorites():
+    user_id = get_jwt_identity()
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT f.id AS favorite_id, m.id AS movie_id, m.title, m.director, m.release_date, m.category_id
+            FROM favorites f
+            JOIN movies m ON f.movie_id = m.id
+            WHERE f.user_id = %s
+        """, (user_id,))
+
+        favorites = cursor.fetchall()
+
+        cursor.close()
+        connection.close()
+        return jsonify(favorites), 200
+    except Exception as e:
+        return jsonify({'message': f'Error fetching favorites: {str(e)}'}), 500
+
+#favorilerden silme
+@app.route('/api/favorites/<int:favorite_id>', methods=['DELETE'])
+@jwt_required()
+def delete_favorite(favorite_id):
+    user_id = get_jwt_identity()
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("DELETE FROM favorites WHERE id = %s AND user_id = %s", (favorite_id, user_id))
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
+    return jsonify({'message': 'Favorite deleted successfully'}), 200
+
+#kategoriler listelenir
+@app.route('/api/categories', methods=['GET'])
+def get_categories():
+    connection = get_db_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    try:
+        cursor.execute("SELECT * FROM categories")
+        categories = cursor.fetchall()
+        return jsonify(categories), 200
+    except mysql.connector.Error as err:
+        return jsonify({'message': f'Error: {err}'}), 500
+    finally:
+        cursor.close()
+        connection.close()
+
+
+
+# Global Hata Yönetimi
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'message': 'An internal error occurred', 'details': str(error)}), 500
+
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({'message': 'Resource not found'}), 404
+
+#çalıştırma işlemi
+if __name__ == '__main__':
+    app.run(debug=True)
